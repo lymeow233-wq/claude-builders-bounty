@@ -1,0 +1,2 @@
+/.gitattributes text eol=lf
+hooks/destructive-command-blocker/* text eol=lf
