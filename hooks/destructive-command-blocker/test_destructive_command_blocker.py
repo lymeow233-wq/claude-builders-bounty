@@ -107,10 +107,13 @@ class DestructiveCommandBlockerTests(unittest.TestCase):
     def test_blocks_sql_client_payloads(self) -> None:
         cases = [
             ('echo "DROP TABLE users" | psql mydb', "DROP TABLE"),
+            ("echo DROP TABLE users | psql mydb", "DROP TABLE"),
+            ('printf "DROP TABLE users;" | psql mydb', "DROP TABLE"),
             ('sqlite3 app.db "DELETE FROM users"', "DELETE FROM without WHERE"),
             ('mysql --execute="DROP DATABASE prod"', "DROP DATABASE"),
             ('sqlcmd -Q "TRUNCATE TABLE dbo.sessions"', "TRUNCATE"),
             ('docker exec db psql -c "DELETE FROM audit_log"', "DELETE FROM without WHERE"),
+            ("psql <<SQL\nDROP TABLE users;\nSQL", "DROP TABLE"),
         ]
         for command, expected_rule in cases:
             with self.subTest(command=command):
@@ -127,6 +130,56 @@ class DestructiveCommandBlockerTests(unittest.TestCase):
         for command, expected_rule in cases:
             with self.subTest(command=command):
                 self.assert_blocked(command, expected_rule)
+
+    def test_blocks_destructive_sql_from_input_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "project"
+            hooks_dir = Path(tmpdir) / "hooks"
+            workdir.mkdir()
+            hooks_dir.mkdir()
+
+            files = {
+                "drop.sql": "DROP TABLE users;\n",
+                "drop_schema.sql": "DROP SCHEMA private;\n",
+                "truncate.sql": "TRUNCATE TABLE audit_log;\n",
+                "delete.sql": "DELETE FROM sessions;\n",
+                "prod": "DROP TABLE production_users;\n",
+                "DROP TABLE users.sql": "DELETE FROM sessions WHERE expires_at < now();\n",
+                "safe.sql": "DELETE FROM sessions WHERE expires_at < now();\n",
+            }
+            for filename, contents in files.items():
+                (workdir / filename).write_text(contents, encoding="utf-8")
+
+            blocked_cases = [
+                ("psql -f drop.sql", "DROP TABLE"),
+                ("psql --file=drop_schema.sql", "DROP SCHEMA"),
+                ("sqlcmd -i truncate.sql", "TRUNCATE"),
+                ("mysql < delete.sql", "DELETE FROM without WHERE"),
+                ("cat drop.sql | psql mydb", "DROP TABLE"),
+            ]
+            for command, expected_rule in blocked_cases:
+                with self.subTest(command=command):
+                    payload = {
+                        "tool_name": "Bash",
+                        "tool_input": {"command": command, "cwd": str(workdir)},
+                    }
+                    result = self.run_hook(command, hooks_dir, raw_input=json.dumps(payload))
+                    self.assertEqual(result.returncode, 0)
+                    response = json.loads(result.stdout)
+                    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+                    self.assertIn(expected_rule, reason)
+                    self.assertIn("SQL input file", reason)
+
+            safe_payload = {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": 'psql -f safe.sql && mysql -f prod && psql -f "DROP TABLE users.sql"',
+                    "cwd": str(workdir),
+                },
+            }
+            safe_result = self.run_hook("", hooks_dir, raw_input=json.dumps(safe_payload))
+            self.assertEqual(safe_result.returncode, 0)
+            self.assertEqual(safe_result.stdout, "")
 
     def test_allows_safe_commands_and_false_positive_strings(self) -> None:
         cases = [

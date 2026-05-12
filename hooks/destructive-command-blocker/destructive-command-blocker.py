@@ -58,14 +58,33 @@ SQL_OPTION_FLAGS = {
     "/Q",
 }
 
+SQL_FILE_OPTION_FLAGS_BY_CLIENT = {
+    "psql": {"-f", "--file"},
+    "sqlcmd": {"-i", "--input", "--input-file"},
+    "sqlite": {"-init"},
+    "sqlite3": {"-init"},
+}
+
+SQL_STDIN_SOURCE_COMMANDS = {
+    "cat",
+    "type",
+}
+
+SQL_STDIN_TEXT_COMMANDS = {
+    "echo",
+    "printf",
+}
+
+MAX_SQL_FILE_BYTES = 1024 * 1024
+
 SQL_KEYWORD_RE = re.compile(
-    r"(?is)\b(drop\s+(?:table|database|schema)|truncate(?:\s+table)?|delete\s+from)\b"
+    r"(?is)\b(drop\s+(?:table|database|schema)(?=\s|;|$)|truncate(?:\s+table)?(?=\s|;|$)|delete\s+from\b)"
 )
 SQL_STATEMENT_START_RE = re.compile(
-    r"(?is)^\s*(?:drop\s+(?:table|database|schema)|truncate(?:\s+table)?|delete\s+from)\b"
+    r"(?is)^\s*(?:drop\s+(?:table|database|schema)(?=\s|;|$)|truncate(?:\s+table)?(?=\s|;|$)|delete\s+from\b)"
 )
 DROP_OR_TRUNCATE_RE = re.compile(
-    r"(?is)\b(?:drop\s+(?:table|database|schema)|truncate(?:\s+table)?)\b"
+    r"(?is)\b(?:drop\s+(?:table|database|schema)(?=\s|;|$)|truncate(?:\s+table)?(?=\s|;|$))"
 )
 DELETE_FROM_RE = re.compile(r"(?is)\bdelete\s+from\b")
 WHERE_RE = re.compile(r"(?is)\bwhere\b")
@@ -92,11 +111,11 @@ def main() -> int:
     if not command:
         return 0
 
-    detection = detect_destructive_command(command)
+    project_path = extract_project_path(payload)
+    detection = detect_destructive_command(command, project_path)
     if detection is None:
         return 0
 
-    project_path = extract_project_path(payload)
     log_blocked_attempt(command, project_path, detection)
     print(deny_response(detection))
     return 0
@@ -119,7 +138,7 @@ def extract_command(payload: dict[str, Any]) -> str:
     return command if isinstance(command, str) else ""
 
 
-def detect_destructive_command(command: str, depth: int = 0) -> Detection | None:
+def detect_destructive_command(command: str, cwd: str | None = None, depth: int = 0) -> Detection | None:
     if depth > 3:
         return None
 
@@ -128,18 +147,18 @@ def detect_destructive_command(command: str, depth: int = 0) -> Detection | None
         return fallback_text_detection(command)
 
     for embedded_command in embedded_shell_commands(tokens):
-        detection = detect_destructive_command(embedded_command, depth + 1)
+        detection = detect_destructive_command(embedded_command, cwd, depth + 1)
         if detection is not None:
             return detection
 
-    for detector in (
-        detect_rm_recursive_force,
-        detect_git_force_push,
-        detect_destructive_sql,
-    ):
+    for detector in (detect_rm_recursive_force, detect_git_force_push):
         detection = detector(command, tokens)
         if detection is not None:
             return detection
+
+    detection = detect_destructive_sql(command, tokens, cwd)
+    if detection is not None:
+        return detection
 
     return None
 
@@ -295,7 +314,7 @@ def git_subcommand_index(args: list[str]) -> int | None:
     return None
 
 
-def detect_destructive_sql(command: str, tokens: list[str]) -> Detection | None:
+def detect_destructive_sql(command: str, tokens: list[str], cwd: str | None = None) -> Detection | None:
     direct_payload = direct_sql_payload(command)
     if direct_payload:
         detection = classify_sql(direct_payload)
@@ -304,13 +323,24 @@ def detect_destructive_sql(command: str, tokens: list[str]) -> Detection | None:
 
     payloads = sql_payloads_from_clients(tokens)
     if has_sql_client(tokens):
-        payloads.extend(token for token in tokens if looks_like_sql(token))
-        payloads.append(command)
+        payloads.extend(sql_stdin_text_payloads_from_clients(tokens))
+        if "<<" in command:
+            payloads.append(command)
 
     for payload in payloads:
         detection = classify_sql(payload)
         if detection is not None:
             return detection
+
+    for path, payload in sql_file_payloads_from_clients(tokens, cwd):
+        detection = classify_sql(payload)
+        if detection is not None:
+            return Detection(
+                detection.rule,
+                detection.reason,
+                f"{detection.evidence} in SQL input file {path}",
+                detection.severity,
+            )
 
     return None
 
@@ -340,6 +370,129 @@ def sql_payloads_from_clients(tokens: list[str]) -> list[str]:
                 payloads.append(arg)
 
     return payloads
+
+
+def sql_stdin_text_payloads_from_clients(tokens: list[str]) -> list[str]:
+    payloads: list[str] = []
+    for index, token in enumerate(tokens):
+        if base_name(token) in SQL_CLIENTS:
+            payloads.extend(piped_text_payloads(tokens, index))
+    return payloads
+
+
+def piped_text_payloads(tokens: list[str], sql_client_index: int) -> Iterable[str]:
+    source_command = piped_source_command(tokens, sql_client_index)
+    if not source_command or base_name(source_command[0]) not in SQL_STDIN_TEXT_COMMANDS:
+        return
+
+    args = [
+        arg
+        for arg in source_command[1:]
+        if arg != "--" and not (base_name(source_command[0]) == "echo" and arg.startswith("-"))
+    ]
+    if args:
+        yield " ".join(args)
+
+
+def sql_file_payloads_from_clients(tokens: list[str], cwd: str | None = None) -> list[tuple[str, str]]:
+    payloads: list[tuple[str, str]] = []
+    seen: set[Path] = set()
+
+    for index, token in enumerate(tokens):
+        if base_name(token) not in SQL_CLIENTS:
+            continue
+
+        for candidate in sql_file_candidates(tokens, index):
+            resolved = resolve_sql_file(candidate, cwd)
+            if resolved is None or resolved in seen:
+                continue
+            seen.add(resolved)
+            content = read_sql_file(resolved)
+            if content is not None:
+                payloads.append((str(resolved), content))
+
+    return payloads
+
+
+def sql_file_candidates(tokens: list[str], sql_client_index: int) -> Iterable[str]:
+    client = base_name(tokens[sql_client_index])
+    file_flags = SQL_FILE_OPTION_FLAGS_BY_CLIENT.get(client, set())
+    args = list(command_args_after(tokens, sql_client_index))
+    for arg_index, arg in enumerate(args):
+        lowered = arg.lower()
+        if lowered in file_flags and arg_index + 1 < len(args):
+            yield args[arg_index + 1]
+        elif any(
+            lowered.startswith(flag + "=")
+            for flag in file_flags
+            if flag.startswith("--")
+        ):
+            yield arg.split("=", 1)[1]
+        elif "-f" in file_flags and lowered.startswith("-f") and len(arg) > 2:
+            yield arg[2:]
+        elif "-i" in file_flags and lowered.startswith("-i") and len(arg) > 2:
+            yield arg[2:]
+        elif lowered.startswith("<") and len(arg) > 1 and not lowered.startswith("<<"):
+            yield arg[1:]
+        elif arg == "<" and arg_index + 1 < len(args):
+            yield args[arg_index + 1]
+
+    yield from piped_file_candidates(tokens, sql_client_index)
+
+
+def piped_file_candidates(tokens: list[str], sql_client_index: int) -> Iterable[str]:
+    source_command = piped_source_command(tokens, sql_client_index)
+    if not source_command or base_name(source_command[0]) not in SQL_STDIN_SOURCE_COMMANDS:
+        return
+
+    for arg in source_command[1:]:
+        if arg == "--":
+            continue
+        if arg.startswith("-"):
+            continue
+        yield arg
+
+
+def piped_source_command(tokens: list[str], sql_client_index: int) -> list[str]:
+    pipe_index = sql_client_index - 1
+    while pipe_index >= 0 and tokens[pipe_index] not in {"|", "|&"}:
+        if tokens[pipe_index] in COMMAND_SEPARATORS:
+            return []
+        pipe_index -= 1
+    if pipe_index < 1:
+        return []
+
+    source_start = pipe_index - 1
+    while source_start > 0 and tokens[source_start - 1] not in COMMAND_SEPARATORS:
+        source_start -= 1
+    return tokens[source_start:pipe_index]
+
+
+def resolve_sql_file(candidate: str, cwd: str | None = None) -> Path | None:
+    if not candidate or candidate in {"-", "/dev/stdin"}:
+        return None
+    if any(char in candidate for char in "\x00$`*?[]{}"):
+        return None
+
+    path = Path(os.path.expanduser(candidate))
+    if not path.is_absolute():
+        path = Path(cwd or os.getcwd()).expanduser() / path
+
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return None
+    return resolved
+
+
+def read_sql_file(path: Path) -> str | None:
+    try:
+        file_stat = path.stat()
+        if not path.is_file() or file_stat.st_size > MAX_SQL_FILE_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def has_sql_client(tokens: list[str]) -> bool:
