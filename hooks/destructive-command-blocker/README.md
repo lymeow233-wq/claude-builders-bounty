@@ -6,12 +6,12 @@ Claude Code `PreToolUse` hook that blocks destructive Bash commands before they 
 
 - Recursive forced deletion through `rm -rf`, `rm -fr`, `rm --recursive --force`, and wrapper commands such as `sudo rm -rf`, `bash -lc "rm -rf ..."`, or `find ... -exec rm -rf`.
 - Forced Git pushes through `git push --force`, `git push -f`, `git push --force-with-lease`, and forced refspecs such as `git push origin +main`.
-- Destructive SQL sent to common database clients such as `psql`, `mysql`, `mariadb`, `sqlite3`, `duckdb`, and `sqlcmd`:
+- Direct destructive SQL statements, plus destructive SQL sent to common database clients such as `psql`, `mysql`, `mariadb`, `sqlite3`, `duckdb`, and `sqlcmd`:
   - `DROP TABLE`, `DROP DATABASE`, and `DROP SCHEMA`
   - `TRUNCATE`
   - `DELETE FROM` statements without a `WHERE` clause
 
-The detector tokenizes the shell command before matching, so documentation/search commands such as `echo "rm -rf build"` and `grep -R "DROP TABLE" docs` are not blocked.
+The detector tokenizes the shell command before matching, so documentation/search commands such as `echo "rm -rf build"`, `grep -R "DROP TABLE" docs`, and `printf "DELETE FROM users" >> examples.sql` are not blocked.
 
 Blocked attempts are appended as JSON lines to `~/.claude/hooks/blocked.log` with the UTC timestamp, severity, rule, reason, evidence, attempted command, and project path.
 
@@ -52,4 +52,4 @@ echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf node_modules","cwd":"/
 
 Expected output contains `permissionDecision: "deny"` and a clear reason for Claude. Safe Bash commands exit without output so they do not interfere with normal work.
 
-The included tests cover the required acceptance criteria plus wrapper commands, nested shell commands, Git forced refspecs, SQL clients, piped SQL input, false-positive strings, non-Bash tool payloads, invalid input, logging, and installer idempotency.
+The included tests cover the required acceptance criteria plus wrapper commands, nested shell commands, Git forced refspecs, direct SQL statements, SQL clients, piped SQL input, false-positive strings, non-Bash tool payloads, invalid input, logging, and installer idempotency.

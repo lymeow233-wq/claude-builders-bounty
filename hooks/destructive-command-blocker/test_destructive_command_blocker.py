@@ -116,6 +116,18 @@ class DestructiveCommandBlockerTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_blocked(command, expected_rule)
 
+    def test_blocks_direct_destructive_sql_statements(self) -> None:
+        cases = [
+            ("DROP TABLE users", "DROP TABLE"),
+            ("TRUNCATE audit_log", "TRUNCATE"),
+            ("DELETE FROM sessions", "DELETE FROM without WHERE"),
+            ("-- maintenance\nDROP TABLE stale_sessions", "DROP TABLE"),
+            ("echo done; DELETE FROM audit_log", "DELETE FROM without WHERE"),
+        ]
+        for command, expected_rule in cases:
+            with self.subTest(command=command):
+                self.assert_blocked(command, expected_rule)
+
     def test_allows_safe_commands_and_false_positive_strings(self) -> None:
         cases = [
             "git status --short",
@@ -124,6 +136,8 @@ class DestructiveCommandBlockerTests(unittest.TestCase):
             'echo "rm -rf build"',
             'printf "git push --force"',
             'grep -R "DROP TABLE" docs',
+            "printf 'DELETE FROM users' >> examples.sql",
+            "DELETE FROM users WHERE id = 1",
             'psql -c "DELETE FROM users WHERE id = 1"',
             "psql -c \"SELECT 'DELETE FROM users' AS example\"",
         ]
@@ -134,6 +148,20 @@ class DestructiveCommandBlockerTests(unittest.TestCase):
     def test_ignores_non_bash_tool_and_invalid_input(self) -> None:
         self.assert_allowed("rm -rf build", tool_name="Read")
         self.assert_allowed("", raw_input="{not json")
+
+    def test_project_path_fallback_uses_transcript_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hooks_dir = Path(tmpdir)
+            payload = {
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf build"},
+                "transcript_path": "/tmp/example-project/.claude/session.jsonl",
+            }
+            result = self.run_hook("", hooks_dir, raw_input=json.dumps(payload))
+
+            self.assertEqual(result.returncode, 0)
+            log_event = json.loads((hooks_dir / "blocked.log").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(log_event["project_path"], "/tmp/example-project/.claude")
 
     def test_installer_is_idempotent_and_preserves_existing_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

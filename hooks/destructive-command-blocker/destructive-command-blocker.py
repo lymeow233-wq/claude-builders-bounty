@@ -61,6 +61,9 @@ SQL_OPTION_FLAGS = {
 SQL_KEYWORD_RE = re.compile(
     r"(?is)\b(drop\s+(?:table|database|schema)|truncate(?:\s+table)?|delete\s+from)\b"
 )
+SQL_STATEMENT_START_RE = re.compile(
+    r"(?is)^\s*(?:drop\s+(?:table|database|schema)|truncate(?:\s+table)?|delete\s+from)\b"
+)
 DROP_OR_TRUNCATE_RE = re.compile(
     r"(?is)\b(?:drop\s+(?:table|database|schema)|truncate(?:\s+table)?)\b"
 )
@@ -81,7 +84,7 @@ def main() -> int:
     if payload is None:
         return 0
 
-    tool_name = str(payload.get("tool_name", ""))
+    tool_name = str(payload.get("tool_name") or payload.get("tool") or "")
     if tool_name.lower() != "bash":
         return 0
 
@@ -293,6 +296,12 @@ def git_subcommand_index(args: list[str]) -> int | None:
 
 
 def detect_destructive_sql(command: str, tokens: list[str]) -> Detection | None:
+    direct_payload = direct_sql_payload(command)
+    if direct_payload:
+        detection = classify_sql(direct_payload)
+        if detection is not None:
+            return detection
+
     payloads = sql_payloads_from_clients(tokens)
     if has_sql_client(tokens):
         payloads.extend(token for token in tokens if looks_like_sql(token))
@@ -304,6 +313,14 @@ def detect_destructive_sql(command: str, tokens: list[str]) -> Detection | None:
             return detection
 
     return None
+
+
+def direct_sql_payload(command: str) -> str:
+    normalized = strip_sql_comments_and_literals(command)
+    for statement in split_sql_statements(normalized):
+        if SQL_STATEMENT_START_RE.search(statement):
+            return statement
+    return ""
 
 
 def sql_payloads_from_clients(tokens: list[str]) -> list[str]:
@@ -427,17 +444,31 @@ def base_name(token: str) -> str:
 def extract_project_path(payload: dict[str, Any]) -> str:
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
-        for key in ("cwd", "project_path"):
+        for key in ("cwd", "workdir", "project_path", "project_dir", "workspace"):
             value = tool_input.get(key)
             if isinstance(value, str) and value:
                 return value
 
-    for key in ("cwd", "project_path"):
+    for key in ("cwd", "workdir", "project_path", "project_dir", "workspace"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
 
+    transcript_path = payload.get("transcript_path")
+    if isinstance(transcript_path, str) and transcript_path:
+        return parent_path_string(transcript_path)
+
     return os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+
+def parent_path_string(value: str) -> str:
+    expanded = os.path.expanduser(value).rstrip("/\\")
+    separator_index = max(expanded.rfind("/"), expanded.rfind("\\"))
+    if separator_index > 0:
+        return expanded[:separator_index]
+    if separator_index == 0:
+        return expanded[:1]
+    return str(Path(expanded).parent)
 
 
 def hook_dir() -> Path:
