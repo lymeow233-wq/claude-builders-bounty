@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -61,7 +62,7 @@ def read_settings(settings_file: Path) -> dict[str, object]:
 def hook_command(hook_file: Path) -> str:
     if os.name == "nt":
         return f'"{sys.executable}" "{hook_file}"'
-    return str(hook_file)
+    return shlex.quote(str(hook_file))
 
 
 def add_hook(settings: dict[str, object], command: str) -> None:
