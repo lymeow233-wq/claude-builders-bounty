@@ -27,7 +27,7 @@ from typing import Iterable
 
 
 CONFIDENCE_VALUES = {"Low", "Medium", "High"}
-MAX_DIFF_CHARS_DEFAULT = 120_000
+MAX_DIFF_CHARS_DEFAULT = 500_000
 MIN_DIFF_CHARS = 1_000
 REVIEW_MARKER = "<!-- claude-review-agent -->"
 CONFIG_FILENAMES = (".claude-review.yml", ".claude-review.yaml", ".claude-review.json")
@@ -53,6 +53,28 @@ TEXT_EXTENSIONS = {
     ".ts",
     ".tsx",
 }
+RUNTIME_RISK_EXTENSIONS = TEXT_EXTENSIONS | {
+    ".bash",
+    ".env",
+    ".ini",
+    ".json",
+    ".ps1",
+    ".psm1",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
+DOCUMENTATION_EXTENSIONS = {".adoc", ".diff", ".md", ".patch", ".rst", ".txt"}
+NOISE_PATH_MARKERS = (
+    "/docs/",
+    "/examples/",
+    "/fixtures/",
+    "/samples/",
+)
+SCRIPT_FILENAMES = {".env", "dockerfile", "makefile"}
 EXCLUDED_SCAN_DIRS = {
     ".git",
     ".hg",
@@ -151,6 +173,7 @@ class DiffStats:
     added_records: list[DiffLine] = field(default_factory=list)
     removed_records: list[DiffLine] = field(default_factory=list)
     symbol_changes: list[SymbolChange] = field(default_factory=list)
+    new_files: set[str] = field(default_factory=set)
     removed_lines: list[str] = field(default_factory=list)
     total_additions: int = 0
     total_deletions: int = 0
@@ -473,6 +496,7 @@ def parse_diff(diff: str, max_chars: int = MAX_DIFF_CHARS_DEFAULT) -> DiffStats:
     current_file = ""
     next_new_line: int | None = None
     current_symbol: SymbolChange | None = None
+    old_file_was_dev_null = False
     for line in trimmed.splitlines():
         if line.startswith("diff --git "):
             paths = parse_diff_git_paths(line)
@@ -485,12 +509,19 @@ def parse_diff(diff: str, max_chars: int = MAX_DIFF_CHARS_DEFAULT) -> DiffStats:
                 current_file = path
                 next_new_line = None
                 current_symbol = None
+                old_file_was_dev_null = False
+        elif line.startswith("new file mode ") and current_file:
+            stats.new_files.add(current_file)
+        elif line.startswith("--- /dev/null"):
+            old_file_was_dev_null = True
         elif line.startswith("+++ b/"):
             path = normalize_diff_path(line[len("+++ ") :])
             if path != "/dev/null" and path not in files:
                 files.append(path)
             if path != "/dev/null":
                 current_file = path
+                if old_file_was_dev_null:
+                    stats.new_files.add(path)
         elif line.startswith("@@ "):
             next_new_line = parse_hunk_new_start(line)
             current_symbol = None
@@ -585,6 +616,38 @@ def is_test_path(path: str) -> bool:
     )
 
 
+def path_suffix(path: str) -> str:
+    normalized = normalize_repo_relative_path(path)
+    return Path(normalized).suffix.lower()
+
+
+def is_noise_path(path: str) -> bool:
+    normalized = "/" + normalize_repo_relative_path(path).lower().lstrip("/")
+    return any(marker in normalized for marker in NOISE_PATH_MARKERS) or path_suffix(normalized) in DOCUMENTATION_EXTENSIONS
+
+
+def is_runtime_risk_path(path: str) -> bool:
+    if not path or is_test_path(path) or is_noise_path(path):
+        return False
+    suffix = path_suffix(path)
+    filename = normalize_repo_relative_path(path).rsplit("/", 1)[-1].lower()
+    return suffix in RUNTIME_RISK_EXTENSIONS or filename in SCRIPT_FILENAMES or filename.startswith(".env.")
+
+
+def is_symbol_reference_path(path: str) -> bool:
+    if not path or is_noise_path(path):
+        return False
+    return path_suffix(path) in TEXT_EXTENSIONS
+
+
+def strip_string_literals(text: str) -> str:
+    return re.sub(
+        r"""(?:[rRuUbBfF]{0,3})(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""",
+        "",
+        text,
+    )
+
+
 def is_meaningful_code_line(text: str) -> bool:
     stripped = text.strip().lstrip("\ufeff")
     if not stripped:
@@ -625,7 +688,7 @@ def is_trackable_symbol(name: str) -> bool:
 
 def extract_symbol_change(text: str, path: str, line: int | None) -> SymbolChange | None:
     stripped = text.strip().lstrip("\ufeff")
-    if not stripped or is_test_path(path):
+    if not stripped or is_test_path(path) or not is_symbol_reference_path(path):
         return None
 
     patterns: list[tuple[str, str]] = [
@@ -725,6 +788,20 @@ def delete_without_where(line: str) -> bool:
     )
 
 
+def contains_force_delete(line: str) -> bool:
+    pattern = r"\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\b"
+    if re.search(pattern, strip_string_literals(line), re.IGNORECASE):
+        return True
+    if not re.search(pattern, line, re.IGNORECASE):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:subprocess\.[A-Za-z_]+|os\.system|os\.popen|Popen|exec[lv]?[pe]?|shell\s*=)\b",
+            line,
+        )
+    )
+
+
 def format_dependency_refs(refs: list[DiffLine], limit: int = 3) -> str:
     locations = []
     for ref in refs[:limit]:
@@ -737,7 +814,7 @@ def format_dependency_refs(refs: list[DiffLine], limit: int = 3) -> str:
 def dependency_diff_references(stats: DiffStats, symbol: SymbolChange) -> list[DiffLine]:
     refs: list[DiffLine] = []
     for record in stats.added_records:
-        if record.path == symbol.path or is_test_path(record.path):
+        if record.path == symbol.path or is_test_path(record.path) or not is_symbol_reference_path(record.path):
             continue
         if references_symbol(record.text, symbol) and not is_import_only_reference(record.text):
             refs.append(record)
@@ -793,7 +870,12 @@ def repo_symbol_references(
     pattern = symbol_reference_pattern(symbol.name)
     for path in iter_repo_files(root):
         relative = normalize_repo_relative_path(path.relative_to(root).as_posix())
-        if relative in changed_files or relative == normalize_repo_relative_path(symbol.path) or is_test_path(relative):
+        if (
+            relative in changed_files
+            or relative == normalize_repo_relative_path(symbol.path)
+            or is_test_path(relative)
+            or not is_symbol_reference_path(relative)
+        ):
             continue
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -817,7 +899,10 @@ def repo_symbol_references(
 
 
 def normalize_repo_relative_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/")
 
 
 def build_dependency_findings(stats: DiffStats, repo_root: str | Path | None = None) -> list[Finding]:
@@ -872,7 +957,11 @@ def build_dependency_findings(stats: DiffStats, repo_root: str | Path | None = N
                 )
             )
 
-        if stats.tests_touched and not test_references_symbol(stats, symbol):
+        if (
+            stats.tests_touched
+            and normalize_repo_relative_path(symbol.path) not in stats.new_files
+            and not test_references_symbol(stats, symbol)
+        ):
             key = (symbol.name, "test_relevance")
             if key in seen:
                 continue
@@ -898,6 +987,7 @@ def build_dependency_findings(stats: DiffStats, repo_root: str | Path | None = N
 def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> list[Finding]:
     findings: list[Finding] = []
     total_delta = stats.total_additions + stats.total_deletions
+    runtime_records = [record for record in stats.added_records if is_runtime_risk_path(record.path)]
 
     def add_record_finding(
         code: str,
@@ -921,7 +1011,7 @@ def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> lis
         )
 
     secret_hits = first_record_matches(
-        stats.added_records,
+        runtime_records,
         r"\b(api[_-]?key|secret|token|private[_-]?key|password)\b\s*[:=]\s*['\"][^'\"]{6,}",
         limit=2,
     )
@@ -935,7 +1025,7 @@ def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> lis
             mask_string_literals=True,
         )
 
-    for record in [item for item in stats.added_records if delete_without_where(item.text)][:2]:
+    for record in [item for item in runtime_records if delete_without_where(item.text)][:2]:
         add_record_finding(
             "SQL_DELETE_WITHOUT_WHERE",
             "High",
@@ -944,11 +1034,7 @@ def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> lis
             record,
         )
 
-    for record in first_record_matches(
-        stats.added_records,
-        r"\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\b",
-        limit=2,
-    ):
+    for record in [item for item in runtime_records if contains_force_delete(item.text)][:2]:
         add_record_finding(
             "FORCE_DELETE",
             "High",
@@ -957,7 +1043,12 @@ def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> lis
             record,
         )
 
-    for record in first_record_matches(stats.added_records, r"\bshell\s*=\s*True\b", limit=2):
+    shell_records = [
+        record
+        for record in runtime_records
+        if re.search(r"\bshell\s*=\s*True\b", strip_string_literals(record.text), re.IGNORECASE)
+    ][:2]
+    for record in shell_records:
         add_record_finding(
             "SHELL_TRUE",
             "High",
@@ -966,7 +1057,12 @@ def build_findings(stats: DiffStats, repo_root: str | Path | None = None) -> lis
             record,
         )
 
-    for record in first_record_matches(stats.added_records, r"\bTODO\b|\bFIXME\b", limit=2):
+    todo_records = [
+        record
+        for record in runtime_records
+        if re.search(r"\bTODO\b|\bFIXME\b", strip_string_literals(record.text), re.IGNORECASE)
+    ][:2]
+    for record in todo_records:
         add_record_finding(
             "TODO_IN_CHANGE",
             "Medium",

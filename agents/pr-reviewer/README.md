@@ -171,13 +171,15 @@ The confidence score is deterministic:
 - `Medium` for missing tests, moderate size, dependency-impact findings, or specific risky constructs.
 - `Low` for truncated, very large, or very broad diffs.
 
-Empty diffs are rejected. `--max-diff-chars` must be at least `1000` so the parser has enough context to identify files and changed lines.
+Empty diffs are rejected. `--max-diff-chars` defaults to `500000` and must be at least `1000` so the parser has enough context to identify files and changed lines.
 
 Dependency analysis has two modes:
 
 - Diff-local mode always runs. It tracks changed Python, JavaScript/TypeScript, Go, Rust, class, export, and constant symbols visible in the unified diff, then flags non-test changed callers that reference those symbols.
 - Repo-root mode runs only with `--repo-root`. It scans a bounded set of source files in the local checkout, skips common generated/vendor directories, prefers real use sites over import-only lines, and flags non-test references outside the PR diff.
-- Test relevance mode checks whether changed test lines mention changed symbols. If tests were touched but appear unrelated to the changed symbol, it emits `CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST`.
+- Test relevance mode checks whether changed test lines mention changed symbols from existing non-test files. It avoids flooding all-new packages with one finding per helper, but still emits `CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST` when an existing changed symbol appears to be paired with unrelated test edits.
+
+Runtime-risk rules focus on non-test source/config/script paths and skip tests, documentation, fixtures, examples, and generated sample reports by default. This keeps deliberately dangerous test fixtures and saved review outputs from being reported as live production risks.
 
 GitHub Actions integration can emit `::warning` annotations for located findings. Global findings such as missing tests remain in the review body and step summary rather than being attached to an arbitrary file.
 

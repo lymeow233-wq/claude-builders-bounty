@@ -15,7 +15,8 @@ Claude PR Reviewer Agent for Claude Builders Bounty issue #4.
 - Produces deterministic structured findings with rule code, severity, path, line, and short evidence when available.
 - Tracks changed functions/classes/exports/constants against downstream non-test callers in the PR diff.
 - Supports `--repo-root` to scan a local checkout for non-test references outside the PR diff.
-- Flags touched tests that do not reference changed symbols with `CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST`.
+- Flags touched tests that do not reference changed existing-file symbols with `CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST` while avoiding one finding per helper in all-new packages.
+- Runtime-risk rules skip tests, documentation, fixtures, examples, and saved sample reports by default so intentionally dangerous fixtures do not masquerade as production risks.
 - Supports JSON output for automation via `--format json`.
 - Supports SARIF 2.1.0 output via `--format sarif`.
 - Supports `.claude-review.yml`, `.claude-review.yaml`, or `.claude-review.json` configuration for disabled rules, ignored paths, and severity overrides.
@@ -33,7 +34,7 @@ Claude PR Reviewer Agent for Claude Builders Bounty issue #4.
 ## Hardening Notes
 
 - Empty diffs are rejected before output.
-- `--max-diff-chars` has a lower bound to avoid unusable parser context.
+- `--max-diff-chars` defaults to `500000` and has a lower bound to avoid unusable parser context.
 - PR URL parsing rejects issue URLs and malformed GitHub URLs.
 - Comment posting validates Markdown mode and PR input before printing review output.
 - Existing generated PR comments are updated by hidden marker instead of duplicating comments.
@@ -82,10 +83,19 @@ Latest local verification on 2026-05-13:
 
 ```text
 python -m unittest discover -s agents/pr-reviewer/tests
-Ran 24 tests - OK
+Ran 28 tests - OK
 
 python -m py_compile agents/pr-reviewer/claude-review.py agents/pr-reviewer/claude_review/cli.py agents/pr-reviewer/tests/test_claude_review.py
 passed
+```
+
+Real GitHub Actions workflow smoke on 2026-05-13:
+
+```text
+Temporary fork-only PR: https://github.com/lymeow233-wq/claude-builders-bounty/pull/1
+Run: https://github.com/lymeow233-wq/claude-builders-bounty/actions/runs/25775296994
+Result: success
+Verified: composite action installed the package, ran `claude-review --pr ... --repo-root . --github-annotations --step-summary --update-comment`, and updated the existing bot comment by marker.
 ```
 
 ## Sample Outputs

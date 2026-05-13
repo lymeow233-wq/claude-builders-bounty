@@ -169,6 +169,122 @@ index 3333333..4444444 100644
         self.assertIn("calculate_total", finding.message)
         self.assertEqual(review.confidence, "Medium")
 
+    def test_new_file_symbols_do_not_flood_test_relevance(self):
+        diff = """diff --git a/src/new_feature.py b/src/new_feature.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/new_feature.py
+@@ -0,0 +1,7 @@
++def parse_input(value):
++    return value.strip()
++
++def normalize_input(value):
++    return parse_input(value).lower()
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/test_smoke.py
+@@ -0,0 +1,2 @@
++def test_smoke():
++    assert True
+"""
+        metadata = self.review.PullRequestMetadata(title="new feature fixture")
+        review = self.review.build_review(metadata, diff, 120_000)
+        codes = {finding.code for finding in review.findings}
+        self.assertNotIn("CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST", codes)
+        self.assertIn("src/new_feature.py", review.stats.new_files)
+
+    def test_workflow_shell_variables_are_not_dependency_symbols(self):
+        diff = """diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 1111111..2222222 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -1,3 +1,5 @@
+ name: Build
++run: |
++  MISSING=()
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index 3333333..4444444 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+@@ -1 +1,2 @@
+ def test_smoke():
++    assert True
+"""
+        metadata = self.review.PullRequestMetadata(title="workflow fixture")
+        review = self.review.build_review(metadata, diff, 120_000)
+        codes = {finding.code for finding in review.findings}
+        self.assertNotIn("CHANGED_SYMBOL_WITHOUT_RELEVANT_TEST", codes)
+
+    def test_fixture_sample_and_docs_paths_do_not_emit_runtime_risks(self):
+        diff = """diff --git a/agents/pr-reviewer/tests/fixtures/security.diff b/agents/pr-reviewer/tests/fixtures/security.diff
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/agents/pr-reviewer/tests/fixtures/security.diff
+@@ -0,0 +1,4 @@
+++API_KEY = "not-a-real-secret"
+++subprocess.run(user_input, shell=True)
+++DELETE FROM users;
+++TODO: exercise detector
+diff --git a/agents/pr-reviewer/samples/report.md b/agents/pr-reviewer/samples/report.md
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/agents/pr-reviewer/samples/report.md
+@@ -0,0 +1,2 @@
++- [High][FORCE_DELETE] sample.py:1 - Evidence: `rm -rf /tmp/work`
++- [High][SHELL_TRUE] sample.py:2 - Evidence: `shell=True`
+diff --git a/agents/pr-reviewer/SUBMISSION.md b/agents/pr-reviewer/SUBMISSION.md
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/agents/pr-reviewer/SUBMISSION.md
+@@ -0,0 +1,2 @@
++- External LLM commands run without `shell=True`.
++- The sample fixture includes TODO text for expected output checks.
+diff --git a/agents/pr-reviewer/tests/test_claude_review.py b/agents/pr-reviewer/tests/test_claude_review.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/agents/pr-reviewer/tests/test_claude_review.py
+@@ -0,0 +1,4 @@
++DANGEROUS_FIXTURE = "rm -rf /tmp/work"
++SHELL_FIXTURE = "shell=True"
++TODO_FIXTURE = "TODO: test detector"
++SECRET_FIXTURE = "API_KEY = 'not-a-real-secret'"
+"""
+        metadata = self.review.PullRequestMetadata(title="noise path fixture")
+        review = self.review.build_review(metadata, diff, 120_000)
+        codes = {finding.code for finding in review.findings}
+        self.assertFalse(
+            {"SECRET_LITERAL", "SQL_DELETE_WITHOUT_WHERE", "SHELL_TRUE", "FORCE_DELETE", "TODO_IN_CHANGE"} & codes
+        )
+
+    def test_rule_description_strings_do_not_emit_runtime_risks(self):
+        diff = """diff --git a/src/rules.py b/src/rules.py
+index 1111111..2222222 100644
+--- a/src/rules.py
++++ b/src/rules.py
+@@ -1 +1,8 @@
+ RULES = {
++    "shell": "A subprocess call enables shell=True.",
++    "todo": "New TODO/FIXME marker indicates incomplete follow-up work.",
++    "pattern": r"subprocess\\.[a-z_]+\\([^\\n]*shell=True",
++    "risk": f"{path} calls subprocess with `shell=True`; pass argv lists.",
++    "delete": f"{path} includes `rm -rf`; validate the target path.",
++    "safe": "pass",
+ }
+"""
+        metadata = self.review.PullRequestMetadata(title="rule text fixture")
+        review = self.review.build_review(metadata, diff, 120_000)
+        codes = {finding.code for finding in review.findings}
+        self.assertNotIn("SHELL_TRUE", codes)
+        self.assertNotIn("TODO_IN_CHANGE", codes)
+        self.assertNotIn("FORCE_DELETE", codes)
+
     def test_safe_fixture_can_be_high_confidence(self):
         diff = (FIXTURES / "safe_with_tests.diff").read_text(encoding="utf-8")
         metadata = self.review.PullRequestMetadata(title="safe fixture")
@@ -373,6 +489,11 @@ diff --git a/src/one.py b/src/one.py
         stats = self.review.parse_diff(diff)
         self.assertEqual(stats.files, ["new name.txt", "src/one.py"])
         self.assertEqual(stats.changed_files, 2)
+        self.assertEqual(
+            self.review.normalize_repo_relative_path(".github/workflows/review.yml"),
+            ".github/workflows/review.yml",
+        )
+        self.assertEqual(self.review.normalize_repo_relative_path("./.env"), ".env")
 
     def test_empty_diff_is_rejected_without_stdout(self):
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
